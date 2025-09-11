@@ -1,20 +1,37 @@
 server:
-  port: 8082
+  port: 8086   # <— aquí defines el puerto HTTP del dispatch-consumer
 
 spring:
   application:
     name: dispatch-consumer
   data:
     mongodb:
-      uri: ${MONGODB_URI:mongodb://root:root@localhost:27017}
-      database: bank
+      uri: ${MONGO_URI:mongodb://localhost:27017/cardsdb}
     redis:
       host: ${REDIS_HOST:localhost}
-      port: 6379
+      port: ${REDIS_PORT:6379}
 
-kafka:
-  topic: bank.card.replacements.v1
-  bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
-  schema-registry-url: ${SCHEMA_REGISTRY_URL:http://localhost:8081}
-  group-id: dispatch.consumer.v1
+logging:
+  level:
+    root: INFO
+    reactor.kafka: WARN
+    com.bank.dispatch_consumer: INFO
 
+# Opcional: si usas Spring Actuator para /actuator/health
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      show-details: never
+
+app:
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:29092}
+    group-id: dispatch-consumer
+    schema-registry-url: ${SCHEMA_REGISTRY_URL:http://localhost:8081}
+  topics:
+    main: bank.card.replacements.v1
+    dlt: bank.card.replacements.v1.DLT
