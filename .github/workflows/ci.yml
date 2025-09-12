@@ -1,0 +1,84 @@
+name: ci-dispatch-consumer
+on:
+  push:
+    branches: [ "develop" ]
+
+concurrency:
+  group: ci-dispatch-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- Java / Maven cache ---
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      # --- Detect POM and Dockerfile paths robustly ---
+      - name: Detect paths (pom.xml / Dockerfile)
+        id: paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          POM_PATH="$(git ls-files | grep -E '(^|.*/)+pom\.xml$' | head -n1 || true)"
+          if [ -z "${POM_PATH}" ]; then
+            echo "No pom.xml found" >&2
+            exit 1
+          fi
+          POM_DIR="$(dirname "${POM_PATH}")"
+
+          if [ -f "${POM_DIR}/Dockerfile" ]; then
+            DOCKERFILE="${POM_DIR}/Dockerfile"
+            CTX_DIR="${POM_DIR}"
+          else
+            DOCKERFILE="$(git ls-files | grep -E '(^|.*/)+Dockerfile$' | head -n1 || true)"
+            if [ -z "${DOCKERFILE}" ]; then
+              echo "No Dockerfile found" >&2
+              exit 1
+            fi
+            CTX_DIR="$(dirname "${DOCKERFILE}")"
+          fi
+
+          echo "pom_path=${POM_PATH}"        >> "$GITHUB_OUTPUT"
+          echo "pom_dir=${POM_DIR}"          >> "$GITHUB_OUTPUT"
+          echo "dockerfile=${DOCKERFILE}"    >> "$GITHUB_OUTPUT"
+          echo "context_dir=${CTX_DIR}"      >> "$GITHUB_OUTPUT"
+
+      - name: Build with Maven (skip tests)
+        run: mvn -B -DskipTests -f "${{ steps.paths.outputs.pom_path }}" package
+
+      # --- Docker build & push ---
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Docker meta (tags/labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ secrets.DOCKERHUB_USERNAME }}/dispatch-consumer
+          tags: |
+            type=raw,value=latest
+            type=sha
+
+      - name: Build & Push image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.paths.outputs.context_dir }}
+          file:    ${{ steps.paths.outputs.dockerfile }}
+          push:    true
+          tags:    ${{ steps.meta.outputs.tags }}
+          labels:  ${{ steps.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/dispatch-consumer:buildcache
+          cache-to:   type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/dispatch-consumer:buildcache,mode=max
