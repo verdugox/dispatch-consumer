@@ -1,3 +1,4 @@
+// src/main/java/com/bank/dispatch_consumer/domain/service/ProcessingService.java
 package com.bank.dispatch_consumer.domain.service;
 
 import com.bank.dispatch_consumer.domain.entity.CardReplacementEntity;
@@ -9,6 +10,9 @@ import com.bank.dispatch_consumer.infrastructure.kafka.DltProducer;
 import com.bank.dispatch_consumer.infrastructure.kafka.EventMessage;
 import com.bank.dispatch_consumer.infrastructure.kafka.KafkaRxConsumer;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Maybe;
 import io.reactivex.rxjava3.disposables.Disposable;
@@ -31,12 +35,41 @@ public class ProcessingService {
     private final SnapshotCacheRepository cacheRepo;
     private final DltProducer dlt;
     private final EntityMapper mapper;
+    private final MeterRegistry meter;              // <— Micrometer
     private final ObjectMapper json = new ObjectMapper();
 
     private Disposable subscription;
 
+    // ====== Métricas ======
+    private Counter consumed;
+    private Counter duplicateAck;
+    private Counter persistedFirst;
+    private Counter upsertSecond;
+    private Counter sentToDlt;
+    private Counter processingErrors;
+    private Timer   processTimer;
+
     @PostConstruct
     public void start() {
+        // Inicializa métricas (una sola vez)
+        consumed        = Counter.builder("dispatch_events_consumed_total")
+                .description("Eventos consumidos desde Kafka").register(meter);
+        duplicateAck    = Counter.builder("dispatch_duplicate_ack_total")
+                .description("Primer intento duplicado, solo ACK").register(meter);
+        persistedFirst  = Counter.builder("dispatch_persist_first_total")
+                .description("Insert en Mongo en primer intento").register(meter);
+        upsertSecond    = Counter.builder("dispatch_upsert_second_total")
+                .description("Upsert en Mongo con snapshot (segundo intento)")
+                .register(meter);
+        sentToDlt       = Counter.builder("dispatch_dlt_total")
+                .description("Eventos enviados a DLT").register(meter);
+        processingErrors= Counter.builder("dispatch_processing_errors_total")
+                .description("Errores durante el procesamiento").register(meter);
+        processTimer    = Timer.builder("dispatch_process_timer")
+                .description("Duración del procesamiento por evento")
+                .publishPercentileHistogram()
+                .register(meter);
+
         subscription = consumer.stream()
                 .observeOn(Schedulers.io())
                 .flatMapCompletable(this::routeAndProcess, /*delayErrors*/ false, /*maxConcurrency*/ 4)
@@ -48,16 +81,37 @@ public class ProcessingService {
 
     private Completable routeAndProcess(EventMessage<CardReplacementEvent> msg) {
         return Completable.defer(() -> {
-            CardReplacementEvent ev = msg.getPayload();
-            if (ev == null || ev.getRequestId() == null) {
-                return sendToDltAndAck("unknown", safeJson(msg.getRawKafkaValue()), msg);
+            long start = System.nanoTime();
+            try {
+                consumed.increment();
+
+                CardReplacementEvent ev = msg.getPayload();
+                if (ev == null || ev.getRequestId() == null) {
+                    sentToDlt.increment();
+                    return sendToDltAndAck("unknown", safeJson(msg.getRawKafkaValue()), msg)
+                            .doOnTerminate(() ->
+                                    processTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS));
+                }
+
+                int attempt = ev.getAttemptNumber() == null ? 1 : ev.getAttemptNumber();
+                return (attempt <= 1 ? handleFirstAttempt(ev, msg) : handleSecondAttempt(ev, msg))
+                        .doOnTerminate(() ->
+                                processTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS))
+                        .onErrorResumeNext(err -> {
+                            processingErrors.increment();
+                            log.error("Error processing requestId={}", ev.getRequestId(), err);
+                            sentToDlt.increment();
+                            return sendToDltAndAck(ev.getRequestId(), safeJson(ev), msg);
+                        });
+
+            } catch (Throwable t) {
+                processingErrors.increment();
+                log.error("Fatal error before routing", t);
+                // asegúrate de ack para no bloquear el flujo
+                return Completable.fromAction(msg::ack)
+                        .doOnTerminate(() ->
+                                processTimer.record(System.nanoTime() - start, TimeUnit.NANOSECONDS));
             }
-            int attempt = ev.getAttemptNumber() == null ? 1 : ev.getAttemptNumber();
-            return (attempt <= 1 ? handleFirstAttempt(ev, msg) : handleSecondAttempt(ev, msg))
-                    .onErrorResumeNext(err -> {
-                        log.error("Error processing requestId={}", ev.getRequestId(), err);
-                        return sendToDltAndAck(ev.getRequestId(), safeJson(ev), msg);
-                    });
         });
     }
 
@@ -85,6 +139,7 @@ public class ProcessingService {
 
     private Completable ackDuplicate(CardReplacementEvent ev, EventMessage<CardReplacementEvent> msg) {
         return Completable.fromAction(() -> {
+            duplicateAck.increment();
             log.warn("Duplicate (1st attempt) requestId={}, ack only", ev.getRequestId());
             msg.ack();
         });
@@ -93,26 +148,26 @@ public class ProcessingService {
     private Completable persistAndDispatch(CardReplacementEvent ev, String status, EventMessage<CardReplacementEvent> msg) {
         CardReplacementEntity entity = mapper.toEntity(ev);
         entity.setStatus(status);
-        // Si añadiste auditoría:
         // entity.setReceivedAt(Instant.now().toEpochMilli());
 
-        return mongoRepo.save(entity)                                   // Single<CardReplacementEntity>
-                .flatMapCompletable(saved -> simulateDispatch(ev))      // <- usar flatMapCompletable (devuelve Completable)
-                .andThen(Completable.fromAction(msg::ack));             // ack al final
+        return mongoRepo.save(entity)
+                .doOnSuccess(saved -> persistedFirst.increment())
+                .flatMapCompletable(saved -> simulateDispatch(ev))
+                .andThen(Completable.fromAction(msg::ack));
     }
 
     private Completable updateAndDispatch(CardReplacementEvent ev, String status, EventMessage<CardReplacementEvent> msg) {
         CardReplacementEntity entity = mapper.toEntity(ev);
         entity.setStatus(status);
-        // processedAt es Long (epoch millis)
         entity.setProcessedAt(Instant.now().toEpochMilli());
 
         return mongoRepo.save(entity)
+                .doOnSuccess(saved -> upsertSecond.increment())
                 .flatMapCompletable(saved -> simulateDispatch(ev))
                 .andThen(Completable.fromAction(msg::ack));
     }
 
-    /** Aquí enchufas el llamado real a tu sistema externo; por ahora simulado */
+    /** Simula el despacho externo */
     private Completable simulateDispatch(CardReplacementEvent ev) {
         return Completable.timer(150, TimeUnit.MILLISECONDS)
                 .doOnComplete(() -> log.info("Dispatched [{}] reqId={} cust={}",

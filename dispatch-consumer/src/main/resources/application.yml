@@ -22,10 +22,13 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,prometheus
   endpoint:
     health:
-      show-details: never
+      show-details: always
+  metrics:
+    tags:
+      application: ${spring.application.name}
 
 app:
   kafka:
