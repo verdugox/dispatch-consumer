@@ -7,6 +7,17 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Component;
 import reactor.adapter.rxjava.RxJava3Adapter;
 
+/*
+Es el adaptador de infraestructura MongoDB.
+Implementa la interfaz de dominio CardReplacementRepository.
+Usa un repo reactivo Spring (SpringCardReplacementReactiveRepo) pero lo adapta a RxJava3 con RxJava3Adapter.
+Métodos:
+findByRequestId → busca entidad en Mongo.
+existsByRequestId → verifica existencia por ID.
+save → inserta o actualiza entidad.
+Resumen: traduce entre tu dominio (RxJava3) y la base MongoDB (Reactor/Mono).
+*/
+
 @Component
 @RequiredArgsConstructor
 public class CardReplacementRepositoryMongoAdapter implements CardReplacementRepository {

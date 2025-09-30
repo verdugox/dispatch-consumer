@@ -13,6 +13,20 @@ import reactor.kafka.sender.SenderOptions;
 import java.util.HashMap;
 import java.util.Map;
 
+//Qué hace?
+//Configura cómo este microservicio se conecta a Kafka.
+//Define dos beans:
+//ReceiverOptions<String, Object> → usado por Reactor Kafka para consumir mensajes.
+//bootstrapServers → URL de Kafka.
+//groupId → el grupo de consumidores (para balancear).
+//StringDeserializer → las keys del mensaje son strings.
+//KafkaAvroDeserializer → los valores son eventos Avro (puede devolver GenericRecord).
+//schema.registry.url → dónde está el Schema Registry de Confluent.
+//enable.auto.commit = false → el commit de offsets será manual, controlado por Reactor.
+//auto.offset.reset = earliest → si no hay offset, empieza a leer desde el principio.
+//SenderOptions<String, String> → permite enviar mensajes (por ejemplo, a un DLT o re-publicación).
+//Resumen: este config define el consumidor reactivo de Kafka con Avro y el sender para reintentos/errores.
+
 @Configuration
 public class KafkaConsumerConfig {
 

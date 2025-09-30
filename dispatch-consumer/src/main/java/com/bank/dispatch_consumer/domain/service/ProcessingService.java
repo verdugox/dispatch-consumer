@@ -30,28 +30,34 @@ import java.util.concurrent.TimeUnit;
 @RequiredArgsConstructor
 public class ProcessingService {
 
-    private final KafkaRxConsumer consumer;
-    private final CardReplacementRepository mongoRepo;
-    private final SnapshotCacheRepository cacheRepo;
-    private final DltProducer dlt;
-    private final EntityMapper mapper;
-    private final MeterRegistry meter;              // <— Micrometer
-    private final ObjectMapper json = new ObjectMapper();
+    private final KafkaRxConsumer consumer;               // Suscripción a Kafka (reactivo con RxJava/Reactor)
+    private final CardReplacementRepository mongoRepo;    // Repositorio en MongoDB
+    private final SnapshotCacheRepository cacheRepo;      // Redis: snapshots de producer
+    private final DltProducer dlt;                        // Publicar en Dead Letter Topic si falla
+    private final EntityMapper mapper;                    // Convierte Avro Event → Entity (Mongo)
+    private final MeterRegistry meter;                    // Métricas con Micrometer
+    private final ObjectMapper json = new ObjectMapper(); // Para serializar JSON
 
     private Disposable subscription;
 
     // ====== Métricas ======
-    private Counter consumed;
-    private Counter duplicateAck;
-    private Counter persistedFirst;
-    private Counter upsertSecond;
-    private Counter sentToDlt;
-    private Counter processingErrors;
-    private Timer   processTimer;
+    private Counter consumed; //cuántos eventos Kafka se leyeron.
+    private Counter duplicateAck; // cuántos eran duplicados (primer intento repetido).
+    private Counter persistedFirst; //inserts en Mongo en primer intento.
+    private Counter upsertSecond; //upserts en Mongo en segundo intento (cuando usa snapshot).
+    private Counter sentToDlt; //enviados a DLT.
+    private Counter processingErrors; //errores en procesamiento.
+    private Timer   processTimer; //mide tiempo de procesamiento de cada evento.
 
     @PostConstruct
     public void start() {
-        // Inicializa métricas (una sola vez)
+        //Se inicia al arrancar la app.
+        //Se suscribe al stream de eventos Kafka (consumer.stream()).
+        //Procesa en un pool IO (Schedulers.io()).
+        //flatMapCompletable(this::routeAndProcess, ..., 4) → procesa eventos concurrentes hasta 4 al mismo tiempo.
+        //Si algo falla a nivel global, lo loguea.
+        //Este método es el arranque de tu pipeline reactivo de consumo.
+        //Inicializa métricas (una sola vez)
         consumed        = Counter.builder("dispatch_events_consumed_total")
                 .description("Eventos consumidos desde Kafka").register(meter);
         duplicateAck    = Counter.builder("dispatch_duplicate_ack_total")
@@ -79,6 +85,13 @@ public class ProcessingService {
                 );
     }
 
+    //Incrementa métrica consumed.
+    //Valida el evento:
+    //Si está vacío → manda al DLT.
+    //Si existe → revisa attemptNumber.
+    //Primer intento (<=1) → handleFirstAttempt.
+    //Segundo intento (>1) → handleSecondAttempt.
+    //Si ocurre un error → métrica de error + manda al DLT.
     private Completable routeAndProcess(EventMessage<CardReplacementEvent> msg) {
         return Completable.defer(() -> {
             long start = System.nanoTime();
@@ -115,7 +128,10 @@ public class ProcessingService {
         });
     }
 
-    /** 1ra vez → persistir en Mongo (si no existe) y despachar */
+    /** 1ra vez → persistir en Mongo (si no existe) y despachar
+     * Si ya existe en Mongo → es duplicado → solo hace ACK (duplicateAck).
+     * Si no existe → lo inserta (persistAndDispatch) con estado "DISPATCHED".
+     * */
     private Completable handleFirstAttempt(CardReplacementEvent ev, EventMessage<CardReplacementEvent> msg) {
         return mongoRepo.existsByRequestId(ev.getRequestId())
                 .flatMapCompletable(exists -> exists
@@ -123,7 +139,15 @@ public class ProcessingService {
                         : persistAndDispatch(ev, "DISPATCHED", msg));
     }
 
-    /** 2da vez → leer snapshot Redis (si hay), upsert Mongo y despachar */
+    /** 2da vez → leer snapshot Redis (si hay), upsert Mongo y despachar
+     * Lee snapshot desde Redis (guardado por el producer).
+     * Si no existe → usa el evento Avro original.
+     * mergeSnapshot → combina snapshot JSON + Avro (snapshot tiene prioridad).
+     * MongoDB:
+     * Si ya existía → hace update (updateAndDispatch).
+     * Si no → hace insert (persistAndDispatch).
+     * Esto asegura consistencia incluso si el primer intento falló.
+     * */
     private Completable handleSecondAttempt(CardReplacementEvent ev, EventMessage<CardReplacementEvent> msg) {
         return cacheRepo.getSnapshotJson(ev.getRequestId())
                 .defaultIfEmpty(safeJson(ev))
@@ -137,6 +161,11 @@ public class ProcessingService {
                 });
     }
 
+    //Caso duplicado en primer intento:
+    //Incrementa métrica duplicateAck.
+    //Loguea warning con el requestId.
+    //Hace ACK al mensaje Kafka → para no reprocesarlo.
+    //Evita insertar dos veces el mismo evento en Mongo.
     private Completable ackDuplicate(CardReplacementEvent ev, EventMessage<CardReplacementEvent> msg) {
         return Completable.fromAction(() -> {
             duplicateAck.increment();
@@ -145,6 +174,13 @@ public class ProcessingService {
         });
     }
 
+    //Convierte el evento Avro en entidad de Mongo (mapper.toEntity).
+    //Le setea un estado (ej. "DISPATCHED").
+    //Lo guarda en MongoDB (mongoRepo.save).
+    //Incrementa métrica persistedFirst.
+    //Simula el despacho externo (simulateDispatch).
+    //Finalmente, hace ACK al mensaje Kafka.
+    //Es el flujo feliz del primer intento válido.
     private Completable persistAndDispatch(CardReplacementEvent ev, String status, EventMessage<CardReplacementEvent> msg) {
         CardReplacementEntity entity = mapper.toEntity(ev);
         entity.setStatus(status);
@@ -156,6 +192,12 @@ public class ProcessingService {
                 .andThen(Completable.fromAction(msg::ack));
     }
 
+    //Convierte el evento a entidad Mongo.
+    //Setea estado "DISPATCHED_CACHE" y marca processedAt.
+    //Guarda en Mongo con save → en Mongo, esto funciona como upsert (update si existe, insert si no).
+    //Incrementa métrica upsertSecond.
+    //Simula despacho y ACK.
+    //Es el flujo del segundo intento, donde Redis da un snapshot y Mongo se sincroniza.
     private Completable updateAndDispatch(CardReplacementEvent ev, String status, EventMessage<CardReplacementEvent> msg) {
         CardReplacementEntity entity = mapper.toEntity(ev);
         entity.setStatus(status);
@@ -167,7 +209,13 @@ public class ProcessingService {
                 .andThen(Completable.fromAction(msg::ack));
     }
 
-    /** Simula el despacho externo */
+    /** Simula el despacho externo
+     * Simula una llamada externa (ej. a un core bancario) con un delay de 150ms.
+     * Loguea:
+     * Si salió de snapshot Redis → marca "CACHE".
+     * Si fue insert directo en Mongo → marca "DB".
+     * Útil en demos o pruebas para representar un sistema externo de despacho.
+     */
     private Completable simulateDispatch(CardReplacementEvent ev) {
         return Completable.timer(150, TimeUnit.MILLISECONDS)
                 .doOnComplete(() -> log.info("Dispatched [{}] reqId={} cust={}",
@@ -175,17 +223,31 @@ public class ProcessingService {
                         ev.getRequestId(), ev.getCustomerId()));
     }
 
+    //Si el procesamiento falla, manda el mensaje al Dead Letter Topic (DLT) usando dlt.send.
+    //Después, ACK en Kafka → evita bloquear el consumidor.
+    //Garantiza que ningún mensaje se pierda: o se procesa bien o termina en el DLT.
     private Completable sendToDltAndAck(String key, String jsonPayload, EventMessage<?> msg) {
         return Completable.fromPublisher(dlt.send(key, jsonPayload))
                 .andThen(Completable.fromAction(msg::ack));
     }
 
+    //Serializa cualquier objeto a JSON con Jackson.
+    //Si falla → devuelve "{}" en vez de romper el flujo.
+    //Sirve para logs o para mandar payloads al DLT.
     private String safeJson(Object o) {
         try { return json.writeValueAsString(o); }
         catch (Exception e) { return "{}"; }
     }
 
-    /** Merge: snapshot (JSON) tiene prioridad; cae al evento si falta algo */
+    /** Merge: snapshot (JSON) tiene prioridad; cae al evento si falta algo
+     * Reconstruye el evento final usando el snapshot guardado en Redis.
+     ** Recorre cada campo del JSON:
+     ** Si está en el snapshot → lo usa.
+     ** Si no está → cae al valor original del evento Avro (base).
+     ** Ejemplo: si Redis tiene dirección de entrega y el Avro no, el merge la añade.
+     ** Si el snapshot es inválido → usa directamente el evento Avro original.
+     * Esto asegura que el segundo intento pueda reconstituir la información completa aunque Kafka solo reenvíe parte del evento.
+     * */
     private CardReplacementEvent mergeSnapshot(String jsonSnap, CardReplacementEvent base) {
         try {
             var t = json.readTree(jsonSnap);
