@@ -1,0 +1,29 @@
+<configuration scan="true">
+
+    <!-- 🔹 Consola para desarrollo -->
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{yyyy-MM-dd HH:mm:ss} %-5level [%thread] %logger{36} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 🔹 Logstash appender para enviar logs en JSON a Elasticsearch -->
+    <appender name="LOGSTASH" class="net.logstash.logback.appender.LogstashTcpSocketAppender">
+        <!-- 👇 Si no existe la variable ELASTIC_HOST, usará elasticsearch:5000 -->
+        <destination>${ELASTIC_HOST:-elasticsearch:5000}</destination>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder" />
+    </appender>
+
+    <!-- 🔹 Root logger -->
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+        <appender-ref ref="LOGSTASH"/>
+    </root>
+
+    <!-- 🔹 Logger específico para tu microservicio -->
+    <logger name="com.bank.dispatch_consumer" level="DEBUG" additivity="false">
+        <appender-ref ref="STDOUT"/>
+        <appender-ref ref="LOGSTASH"/>
+    </logger>
+
+</configuration>

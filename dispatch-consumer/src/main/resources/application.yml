@@ -1,5 +1,5 @@
 server:
-  port: 8086   # <— aquí defines el puerto HTTP del dispatch-consumer
+  port: 8086   # puerto HTTP del dispatch-consumer
 
 spring:
   application:
@@ -16,8 +16,11 @@ logging:
     root: INFO
     reactor.kafka: WARN
     com.bank.dispatch_consumer: INFO
+  appender:
+    logstash:
+      # 👇 Si no hay variable ELASTIC_HOST definida, usará elasticsearch:5000 por defecto
+      destination: ${ELASTIC_HOST:elasticsearch:5000}
 
-# Opcional: si usas Spring Actuator para /actuator/health
 management:
   endpoints:
     web:
@@ -29,6 +32,19 @@ management:
   metrics:
     tags:
       application: ${spring.application.name}
+
+# 🔹 OpenTelemetry exporter (igual que en card-ops-producer)
+otel:
+  exporter:
+    otlp:
+      endpoint: http://otel-collector:4317
+  resource:
+    attributes:
+      service.name: ${spring.application.name}
+      service.version: 1.0.0   # ✅ agrega versión del servicio
+  traces:                     # ✅ asegura muestreo de spans
+    sampler:
+      probability: 1.0
 
 app:
   kafka:
